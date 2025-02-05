@@ -1,0 +1,32 @@
+# Custom Matplotlib Style
+
+axes.facecolor       : (0, 0, 0, 0)
+axes.labelpad        : 1
+axes.labelsize       : 7
+axes.linewidth       : 0.5
+axes.spines.right    : False
+axes.spines.top      : False
+figure.dpi           : 300
+figure.autolayout    : True
+figure.facecolor     : (0, 0, 0, 0)
+font.family          : Arial
+font.size            : 7
+lines.linewidth      : 0.5
+savefig.dpi          : 300
+savefig.pad_inches   : 0.02
+savefig.transparent  : True
+xtick.labelsize      : 5
+xtick.major.pad      : 1
+xtick.major.size     : 2
+xtick.major.width    : 0.5
+ytick.labelsize      : 5
+ytick.major.pad      : 1
+ytick.major.size     : 2
+ytick.major.width    : 0.5
+legend.fontsize         : 5
+legend.frameon          : False
+legend.loc              : upper right
+legend.handlelength     : 1
+legend.handletextpad    : 0.5
+legend.borderpad        : 0.5
+legend.labelspacing     : 0.5
