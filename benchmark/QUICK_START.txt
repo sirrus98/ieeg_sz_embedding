@@ -1,0 +1,144 @@
+================================================================================
+QUICK START: Extract All Windows Pipeline
+================================================================================
+
+✓ Implementation complete! All files ready to use.
+
+FILES CREATED/MODIFIED:
+  - extract_all_windows.py          (REWRITTEN - full preprocessing pipeline)
+  - dataset_all_windows.py          (UPDATED - improved padding & loading)
+  - test_extraction.py              (NEW - testing & validation)
+  - README_extraction.md            (NEW - full documentation)
+  - IMPLEMENTATION_SUMMARY.md       (NEW - technical details)
+
+================================================================================
+STEP 1: CONFIGURE PATHS (if needed)
+================================================================================
+
+Edit benchmark/config_benchmark.py and verify these paths are correct:
+
+  RAW_DATA_DIR = "/mnt/leif/littlab/data/BIDS_iEEG"
+  OUTPUT_DATA_DIR = "/users/zcxu/ieeg_sz_embedding/benchmark/data"
+  DATA_DIR = "/mnt/leif/littlab/users/pattnaik/ieeg_sz_embedding/data"
+
+================================================================================
+STEP 2: EXTRACT WINDOWS
+================================================================================
+
+Run the extraction:
+
+  cd /users/zcxu/ieeg_sz_embedding
+  python benchmark/extract_all_windows.py
+
+Expected output:
+  ✓ Initialization complete
+  ✓ Loaded metadata for 888 seizures
+  ✓ Loaded annotations for XXXX channels
+  
+  Extracting windows from 102 patients...
+  Patients: 100%|██████████| 102/102
+  
+  ✓ Extracted ~50,000 total windows
+    Patients processed: 102
+    Interictal (label=0): ~45,000
+    Ictal (label=1): ~5,000
+
+Time: ~3-5 minutes for all patients
+Output: benchmark/data/all_windows_per_patient/*.h5
+
+================================================================================
+STEP 3: TEST EXTRACTION (recommended)
+================================================================================
+
+Verify the extraction worked correctly:
+
+  python benchmark/test_extraction.py
+
+This checks:
+  ✓ HDF5 structure is correct
+  ✓ Data is normalized (mean≈0, std≈1)
+  ✓ Labels are correct
+  ✓ Dataset loading works
+
+================================================================================
+STEP 4: USE IN YOUR CODE
+================================================================================
+
+Load the extracted windows in your training script:
+
+```python
+from benchmark.dataset_all_windows import create_dataloader
+
+# Create dataloader
+dataloader = create_dataloader(
+    h5_dir='benchmark/data/all_windows_per_patient',
+    batch_size=32,
+    shuffle=True,
+    num_workers=4
+)
+
+# Training loop
+for signals, coords, regs, labels in dataloader:
+    # signals: (batch_size, max_channels, 2560)  # Already normalized!
+    # coords: (batch_size, max_channels, 3)
+    # regs: (batch_size, max_channels)
+    # labels: (batch_size,)  # 0=interictal, 1=ictal
+    
+    outputs = model(signals, coords, regs)
+    loss = criterion(outputs, labels)
+    ...
+```
+
+================================================================================
+KEY FEATURES
+================================================================================
+
+✓ PREPROCESSING: Follows make_dataset.py EXACTLY
+  - Notch filter (60Hz)
+  - Bandpass filter (0.5-120Hz, order 10)
+  - Bipolar montage
+  - Resample to 256Hz
+  - Per-channel z-score normalization
+
+✓ WINDOW EXTRACTION: Non-overlapping 10-second windows
+  - Ictal files: pre-ictal (0-30s), ictal (30s-offset), post-ictal
+  - Interictal files: all windows
+
+✓ LABELING: Based on timing
+  - Label 0: Interictal (non-seizure)
+  - Label 1: Ictal (during seizure)
+
+✓ MEMORY EFFICIENT:
+  - One patient at a time
+  - Lazy loading in dataset
+  - HDF5 with compression
+
+✓ DATA ALREADY NORMALIZED:
+  - Per-channel z-score during extraction
+  - Do NOT normalize again!
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Q: Import errors?
+A: Scripts add code/ to sys.path automatically. Make sure code/utils.py exists.
+
+Q: Permission denied?
+A: Update OUTPUT_DATA_DIR in config_benchmark.py to a writable directory.
+
+Q: No windows extracted?
+A: Check that RAW_DATA_DIR points to correct BIDS directory with EDF files.
+
+Q: Data not normalized?
+A: Run test_extraction.py to verify. Should show mean≈0, std≈1.
+
+================================================================================
+MORE HELP
+================================================================================
+
+See detailed documentation:
+  - README_extraction.md       - Full usage guide
+  - IMPLEMENTATION_SUMMARY.md  - Technical details
+
+================================================================================

@@ -1,0 +1,3 @@
+config: !!python/object:config_benchmark.BenchmarkConfig
+  FREEZE_ENCODER: false
+freeze_encoder: false

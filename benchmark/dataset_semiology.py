@@ -88,8 +88,8 @@ class SemiologyDataset(Dataset):
         rid_hup_table = pd.read_csv(self.config.RID_HUP_TABLE_FILE, index_col=0)
         rid_hup_table.dropna(inplace=True, subset=["hupsubjno"])
         
-        for ind, row in rid_hup_table.iterrows():
-            rid_hup_table.loc[ind, "hupsubjno"] = int(row["hupsubjno"][:3])
+        # Extract first 3 characters and convert to int
+        rid_hup_table['hupsubjno'] = rid_hup_table['hupsubjno'].str[:3].astype(int)
         
         rid_hup_table.index = [f"sub-RID{x:04d}" for x in rid_hup_table.index]
         rid_hup_table['hupsubjno'] = [f"HUP{x:03d}" for x in rid_hup_table['hupsubjno']]

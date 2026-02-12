@@ -15,8 +15,11 @@ class BenchmarkConfig:
     """Configuration for benchmark experiments."""
     
     # ===== PATHS - UPDATE THESE FOR YOUR ENVIRONMENT =====
-    # Data directory containing preprocessed seizure data
+    # Data directory containing preprocessed seizure data (READ-ONLY - from pattnaik)
     DATA_DIR = "/mnt/leif/littlab/users/pattnaik/ieeg_sz_embedding/data"
+    
+    # Output directory for saving generated data (WRITE - to zcxu)
+    OUTPUT_DATA_DIR = "/mnt/leif/littlab/users/zcxu/ieeg_sz_embedding/data"
     
     # Raw BIDS data directory for extracting interictal windows
     RAW_DATA_DIR = "/mnt/leif/littlab/data/Human_Data/CNT_iEEG_BIDS"
@@ -34,11 +37,11 @@ class BenchmarkConfig:
     EMBEDDINGS_DIR = "./benchmark_embeddings"
     
     # ===== DATA FILES =====
-    # Ictal (seizure) data - 10 second windows
+    # Ictal (seizure) data - 10 second windows (READ from pattnaik)
     ICTAL_DATA_FILE = os.path.join(DATA_DIR, "all_sz_coords_data_spatiotemporal_regs_10s.pkl")
     
-    # Interictal (non-seizure) data - will be created by extract_interictal_data.py
-    INTERICTAL_DATA_FILE = os.path.join(DATA_DIR, "all_interictal_coords_data_spatiotemporal_regs_10s.pkl")
+    # Interictal (non-seizure) data - will be created by extract_interictal_data.py (WRITE to zcxu)
+    INTERICTAL_DATA_FILE = os.path.join(OUTPUT_DATA_DIR, "all_interictal_coords_data_spatiotemporal_regs_10s.pkl")
     
     # Metadata files
     SEIZURE_METADATA_FILE = os.path.join(DATA_DIR, "metadata/Manual validation.xlsx")
@@ -111,10 +114,12 @@ class BenchmarkConfig:
     @classmethod
     def create_directories(cls):
         """Create necessary directories if they don't exist."""
+        os.makedirs(cls.OUTPUT_DATA_DIR, exist_ok=True)
         os.makedirs(cls.BENCHMARK_CKPT_DIR, exist_ok=True)
         os.makedirs(cls.LOGS_DIR, exist_ok=True)
         os.makedirs(cls.EMBEDDINGS_DIR, exist_ok=True)
         print(f"✓ Created directories:")
+        print(f"  - Output data: {cls.OUTPUT_DATA_DIR}")
         print(f"  - Checkpoints: {cls.BENCHMARK_CKPT_DIR}")
         print(f"  - Logs: {cls.LOGS_DIR}")
         print(f"  - Embeddings: {cls.EMBEDDINGS_DIR}")

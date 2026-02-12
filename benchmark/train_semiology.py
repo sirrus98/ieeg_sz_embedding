@@ -183,6 +183,30 @@ class SemiologyClassifierModule(L.LightningModule):
         }
 
 
+def test_write_permissions(directory):
+    """
+    Test write permissions by creating a temporary test file.
+    
+    Args:
+        directory: Directory path where we want to save data
+        
+    Raises:
+        PermissionError: If we don't have write permissions
+    """
+    test_file = os.path.join(directory, '.permission_test')
+    try:
+        with open(test_file, 'w') as f:
+            f.write("permission test")
+        os.remove(test_file)
+    except PermissionError as e:
+        print(f"\n✗ ERROR: No write permission for {directory}")
+        print(f"  {str(e)}")
+        raise
+    except Exception as e:
+        print(f"\n✗ ERROR: Could not test write permissions for {directory}: {str(e)}")
+        raise
+
+
 def main(args):
     """Main training function."""
     print("=" * 60)
@@ -192,6 +216,12 @@ def main(args):
     # Configuration
     config = BenchmarkConfig()
     config.create_directories()
+    
+    # Test write permissions for checkpoint and log directories
+    print("Testing write permissions...")
+    test_write_permissions(config.BENCHMARK_CKPT_DIR)
+    test_write_permissions(config.LOGS_DIR)
+    print("✓ Write permissions confirmed!\n")
     
     # Override config with command line args
     if args.batch_size is not None:

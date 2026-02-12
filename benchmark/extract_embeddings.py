@@ -224,6 +224,31 @@ def extract_ictal_interictal_embeddings(config, checkpoint_path, output_file):
     print(f"\n✓ Saved embeddings to: {output_file}")
 
 
+def test_write_permissions(filepath):
+    """
+    Test write permissions by creating a temporary test file.
+    
+    Args:
+        filepath: File path where we want to save data
+        
+    Raises:
+        PermissionError: If we don't have write permissions
+    """
+    directory = os.path.dirname(filepath)
+    test_file = os.path.join(directory, '.permission_test')
+    try:
+        with open(test_file, 'w') as f:
+            f.write("permission test")
+        os.remove(test_file)
+    except PermissionError as e:
+        print(f"\n✗ ERROR: No write permission for {filepath}")
+        print(f"  {str(e)}")
+        raise
+    except Exception as e:
+        print(f"\n✗ ERROR: Could not test write permissions for {filepath}: {str(e)}")
+        raise
+
+
 def main(args):
     """Main function."""
     # Configuration
@@ -238,6 +263,11 @@ def main(args):
             output_file = os.path.join(config.EMBEDDINGS_DIR, 'ictal_interictal_embeddings.npz')
     else:
         output_file = args.output
+    
+    # Test write permissions before extracting embeddings
+    print("Testing write permissions...")
+    test_write_permissions(output_file)
+    print("✓ Write permissions confirmed!\n")
     
     # Extract embeddings
     if args.task == 'semiology':
