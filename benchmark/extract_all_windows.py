@@ -28,7 +28,6 @@ import pandas as pd
 import mne
 from glob import glob
 from tqdm import tqdm
-import h5py
 import json
 from scipy.signal import resample_poly
 from fractions import Fraction
@@ -40,11 +39,19 @@ from utils import check_channel_types, clean_labels, notch_filter, bandpass_filt
 class AllWindowsExtractor:
     """Extract all possible 10-second windows from EDF files using make_dataset.py preprocessing."""
     
-    def __init__(self, config=BenchmarkConfig):
-        """Initialize the extractor."""
+    def __init__(self, config=BenchmarkConfig, use_global_norm=False, global_stats_file=None):
+        """
+        Initialize the extractor.
+        
+        Args:
+            config: BenchmarkConfig instance
+            use_global_norm: If True, use global mean/std for normalization. If False, use per-channel.
+            global_stats_file: Path to precomputed global statistics file (JSON)
+        """
         self.config = config
         self.target_sf = config.TARGET_SAMPLING_RATE
         self.window_duration = 10  # seconds
+        self.use_global_norm = use_global_norm
         
         # Load metadata
         self._load_metadata()
@@ -52,7 +59,20 @@ class AllWindowsExtractor:
         # Load annotations and region mappings
         self._load_annotations()
         
+        # Load or compute global statistics if needed
+        if use_global_norm:
+            if global_stats_file and os.path.exists(global_stats_file):
+                self.global_stats = self._load_global_stats(global_stats_file)
+                print(f"✓ Loaded global statistics from {global_stats_file}")
+            else:
+                print(f"✗ Global normalization requested but stats file not found: {global_stats_file}")
+                print(f"  Please run: python extract_all_windows.py --compute-global-stats")
+                raise FileNotFoundError(f"Global stats file not found: {global_stats_file}")
+        else:
+            self.global_stats = None
+        
         print(f"✓ Initialization complete")
+        print(f"  Normalization mode: {'Global' if use_global_norm else 'Per-channel'}")
     
     def _load_metadata(self):
         """Load seizure metadata and patient mappings (from make_dataset.py lines 22-26)."""
@@ -92,54 +112,61 @@ class AllWindowsExtractor:
         # Load master bipolars (line 27-28)
         master_bipolars = pd.read_csv(self.config.ANNOTATIONS_FILE, index_col=0)
         
-        # Load DKT mapping - need to get dkt_to_custom from CONFIG
-        # For now, we'll load the regions file directly
-        regs_file = os.path.join(self.config.DATA_DIR, 'atlases', 'luts', 'dktg_reordered.csv')
-        if os.path.exists(regs_file):
-            regs_li = pd.read_csv(regs_file)
-            regs_li = regs_li.atlas_index.values
-            self.regs = pd.DataFrame(regs_li, columns=['reg'])
-        else:
-            # Fallback
-            self.regs = pd.DataFrame({'reg': list(range(41))})
+        # Load DKT to custom region mapping (from make_dataset.py lines 28-30)
+        # This is identical to CONFIG.dkt_to_custom but loaded directly to avoid import issues
+        dkt_mni_file = os.path.join(self.config.DATA_DIR, 'metadata', 'dkt_mni_parcs_RG.xlsx')
+        if not os.path.exists(dkt_mni_file):
+            raise FileNotFoundError(f"DKT mapping file not found: {dkt_mni_file}")
         
-        # Try to load dkt_to_custom mapping from CONFIG
-        try:
-            # Import CONFIG to get dkt_to_custom
-            from config import CONFIG as MAIN_CONFIG
-            if hasattr(MAIN_CONFIG, 'dkt_to_custom'):
-                master_bipolars['reg'] = master_bipolars.final_label.map(MAIN_CONFIG.dkt_to_custom)
-            else:
-                # Use atlas_index directly if mapping not available
-                master_bipolars['reg'] = master_bipolars.get('final_label', 0)
-        except:
-            # If CONFIG import fails, use final_label directly
-            master_bipolars['reg'] = master_bipolars.get('final_label', 0)
+        dkt_mni_parcs = pd.read_excel(dkt_mni_file, header=None, sheet_name='Sheet1')
+        dkt_custom = dkt_mni_parcs.iloc[:, [0, 2]]
+        dkt_custom.columns = ['dkt', 'custom']
+        dkt_custom = dkt_custom[dkt_custom['dkt'].str.startswith('Label')]
+        dkt_custom['dkt_id'] = dkt_custom['dkt'].str.split(':').str[0].str.strip()
+        dkt_custom['dkt_id'] = dkt_custom['dkt_id'].str.split(' ').str[1].str.strip().astype(int)
+        dkt_custom['dkt'] = dkt_custom['dkt'].str.split(':').str[1].str.strip()
+        dkt_custom.dropna(inplace=True)
+        dkt_to_custom = dict(zip(dkt_custom['dkt'], dkt_custom['custom']))
+        
+        # Map regions
+        master_bipolars['reg'] = master_bipolars.final_label.map(dkt_to_custom)
+        
+        # Load valid regions (lines 30-32)
+        regs_file = os.path.join(self.config.DATA_DIR, 'unique_regs.csv')
+        if not os.path.exists(regs_file):
+            raise FileNotFoundError(f"Region file not found: {regs_file}")
+        
+        regs = pd.read_csv(regs_file)
         
         self.master_bipolars = master_bipolars
+        self.regs = regs
         
         print(f"✓ Loaded annotations for {len(master_bipolars)} channels")
         print(f"✓ Loaded {len(self.regs)} valid regions")
     
+    def _load_global_stats(self, stats_file):
+        """Load precomputed global statistics from JSON file."""
+        import json
+        with open(stats_file, 'r') as f:
+            stats = json.load(f)
+        return {
+            'mean': stats['global_mean'],
+            'std': stats['global_std'],
+            'n_samples': stats['n_samples_used'],
+            'n_files': stats['n_files_sampled']
+        }
+    
+    def _save_global_stats(self, stats, stats_file):
+        """Save global statistics to JSON file."""
+        import json
+        os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+        with open(stats_file, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f"✓ Saved global statistics to {stats_file}")
+    
     def _preprocess_edf(self, edf_file, patient_id):
         """
-        Apply full preprocessing pipeline from make_dataset.py (lines 66-160).
-        
-        Steps:
-        1. Load EDF with mne.io.read_raw_edf()
-        2. Clean channel labels using clean_labels()
-        3. Get channel types using check_channel_types()
-        4. Apply 60Hz notch filter using notch_filter()
-        5. Apply bandpass filter (0.5-120Hz, order=10) using bandpass_filter()
-        6. Apply bipolar montage using bipolar_montage()
-        7. Resample to 256Hz using resample_poly()
-        8. Create MNE RawArray
-        9. Match channels to master_bipolars annotations
-        10. Filter to valid regions from unique_regs
-        
-        Args:
-            edf_file: Path to EDF file
-            patient_id: Patient identifier
+        Apply full preprocessing pipeline from make_dataset.py (lines 66-105).
         
         Returns:
             tuple: (processed_raw_mne, bipolar_ch_names_df) or (None, None) if failed
@@ -194,17 +221,125 @@ class AllWindowsExtractor:
             return new_data, bipolar_ch_names
             
         except Exception as e:
-            # Silently skip files that fail preprocessing
+            print(f"    ERROR preprocessing {os.path.basename(edf_file)}: {str(e)[:100]}")
             return None, None
+    
+    def compute_global_stats(self, n_files=200, output_file=None):
+        """
+        Compute global mean and std from randomly sampled EDF files.
+        
+        Args:
+            n_files: Number of EDF files to sample (default: 200)
+            output_file: Path to save statistics JSON file
+            
+        Returns:
+            dict: Global statistics {'global_mean', 'global_std', 'n_samples_used', 'n_files_sampled'}
+        """
+        print(f"\n{'='*60}")
+        print(f"Computing Global Statistics from {n_files} Random EDF Files")
+        print(f"{'='*60}\n")
+        
+        # Collect all EDF files from all patients
+        all_edf_files = []
+        unique_patients = self.sz_table['Patient'].unique()
+        
+        for patient_id in unique_patients:
+            # Ictal files
+            patient_seizures = self.sz_table[self.sz_table['Patient'] == patient_id]
+            for idx, seizure in patient_seizures.iterrows():
+                edf_files = glob(
+                    os.path.join(
+                        self.config.RAW_DATA_DIR,
+                        patient_id,
+                        "ses-clinical01",
+                        "ieeg",
+                        f"{patient_id}_ses-clinical01_task-ictal{int(seizure.start)}_*.edf"
+                    )
+                )
+                all_edf_files.extend(edf_files)
+            
+            # Interictal files
+            patient_dir = os.path.join(
+                self.config.RAW_DATA_DIR, patient_id, "ses-clinical01", "ieeg"
+            )
+            if os.path.exists(patient_dir):
+                interictal_files = glob(
+                    os.path.join(patient_dir, f"{patient_id}_ses-clinical01_task-interictal*_ieeg.edf")
+                )
+                all_edf_files.extend(interictal_files)
+        
+        print(f"Found {len(all_edf_files)} total EDF files")
+        
+        # Randomly sample n_files
+        import random
+        random.seed(42)  # Reproducibility
+        sampled_files = random.sample(all_edf_files, min(n_files, len(all_edf_files)))
+        
+        print(f"Sampling {len(sampled_files)} files for statistics computation...\n")
+        
+        # Collect all signal values (vectorized)
+        all_values = []
+        n_samples_collected = 0
+        
+        for edf_file in tqdm(sampled_files, desc="Processing files"):
+            try:
+                # Extract patient ID from filename
+                basename = os.path.basename(edf_file)
+                patient_id = basename.split('_')[0]
+                
+                # Preprocess the file
+                processed_raw, bipolar_ch_names = self._preprocess_edf(edf_file, patient_id)
+                
+                if processed_raw is None:
+                    continue
+                
+                # Get all data from this file (before per-channel normalization)
+                data = processed_raw.get_data()  # (n_channels, n_samples)
+                
+                # Flatten and collect (vectorized)
+                all_values.append(data.flatten())
+                n_samples_collected += data.size
+                
+            except Exception as e:
+                continue
+        
+        if len(all_values) == 0:
+            raise ValueError("No valid data collected from sampled files")
+        
+        # Concatenate all values (vectorized)
+        print(f"\nConcatenating {n_samples_collected:,} samples...")
+        all_values = np.concatenate(all_values)
+        
+        # Compute global statistics (vectorized, ignoring NaNs)
+        print(f"Computing global statistics...")
+        global_mean = np.nanmean(all_values)
+        global_std = np.nanstd(all_values)
+        
+        stats = {
+            'global_mean': float(global_mean),
+            'global_std': float(global_std),
+            'n_samples_used': int(n_samples_collected),
+            'n_files_sampled': len(sampled_files)
+        }
+        
+        print(f"\n✓ Global Statistics Computed:")
+        print(f"  Mean: {global_mean:.6f}")
+        print(f"  Std: {global_std:.6f}")
+        print(f"  Samples: {n_samples_collected:,}")
+        print(f"  Files: {len(sampled_files)}")
+        
+        # Save if output file specified
+        if output_file:
+            self._save_global_stats(stats, output_file)
+        
+        return stats
     
     def _match_channels_and_normalize(self, clip, patient_id):
         """
         Match channels to annotations, filter to valid regions, and normalize.
-        From make_dataset.py lines 126-160.
+        From make_dataset.py lines 126-161.
         
-        Args:
-            clip: MNE Raw object with 10-second window
-            patient_id: Patient identifier
+        Supports both per-channel and global normalization.
         
         Returns:
             tuple: (clip_data, clip_coords, clip_reg_idx, ch_names) or (None, None, None, None)
@@ -231,12 +366,20 @@ class AllWindowsExtractor:
             if len(pt_bipolars) == 0:
                 return None, None, None, None
             
-            # Step 10: Apply per-channel z-score normalization (line 145)
-            # CRITICAL: This must match make_dataset.py exactly
-            clip = clip.apply_function(lambda x: (x - np.nanmean(x)) / np.nanstd(x))
+            # Step 10: Apply normalization (line 145)
+            if self.use_global_norm:
+                # Global normalization: (x - global_mean) / global_std (vectorized)
+                clip = clip.apply_function(
+                    lambda x: (x - self.global_stats['mean']) / self.global_stats['std'],
+                    n_jobs=1
+                )
+            else:
+                # Per-channel z-score normalization (original method)
+                clip = clip.apply_function(lambda x: (x - np.nanmean(x)) / np.nanstd(x))
             
             # Make sure clip has same channels as pt_bipolars (line 148)
-            clip = clip.pick_channels(pt_bipolars.name.to_list())
+            # Use pick() instead of legacy pick_channels() to avoid warnings
+            clip = clip.pick(pt_bipolars.name.to_list())
             
             # Step 11: Convert to float16 (line 151)
             clip_data = clip.get_data().astype(np.float16)
@@ -268,15 +411,6 @@ class AllWindowsExtractor:
         - Pre-ictal (0-30s): label=0 (interictal)
         - Ictal (30s to seizure offset): label=1 (ictal)
         - Post-ictal (after offset): label=0 (interictal)
-        
-        Args:
-            edf_file: Path to ictal EDF file
-            patient_id: Patient identifier
-            seizure_start: Seizure start time in original recording (seconds)
-            seizure_end: Seizure end time in original recording (seconds)
-        
-        Returns:
-            list of tuples: (signals, coords, regs, ch_names, label, metadata)
         """
         windows = []
         
@@ -288,9 +422,7 @@ class AllWindowsExtractor:
         
         total_duration = processed_raw.times[-1]
         
-        # Determine seizure timing in file
-        # Files start 30 seconds before seizure, so seizure starts at 30s in file
-        # (from make_dataset.py lines 107-113)
+        # Determine seizure timing in file (from make_dataset.py lines 107-113)
         try:
             original_raw = mne.io.read_raw_edf(edf_file, preload=False, verbose=False)
             if len(original_raw.annotations) > 0 and original_raw.annotations.onset[0] == 30:
@@ -329,9 +461,9 @@ class AllWindowsExtractor:
                     tmin=window_start, tmax=window_end, include_tmax=False, verbose=False
                 )
                 
-                # Check duration
-                if clip.n_times < 60 * self.target_sf:
-                    # Skip if less than expected duration
+                # Check duration (10 seconds = 2560 samples at 256Hz)
+                expected_samples = self.window_duration * self.target_sf
+                if clip.n_times < expected_samples:
                     window_start += self.window_duration
                     continue
                 
@@ -375,13 +507,7 @@ class AllWindowsExtractor:
     def _extract_windows_from_interictal(self, edf_file, patient_id):
         """
         Extract all non-overlapping 10s windows from an interictal EDF file.
-        
-        Args:
-            edf_file: Path to interictal EDF file
-            patient_id: Patient identifier
-        
-        Returns:
-            list of tuples: (signals, coords, regs, ch_names, label, metadata)
+        All windows labeled as interictal (0).
         """
         windows = []
         
@@ -405,9 +531,9 @@ class AllWindowsExtractor:
                     tmin=window_start, tmax=window_end, include_tmax=False, verbose=False
                 )
                 
-                # Check duration
-                if clip.n_times < 60 * self.target_sf:
-                    # Skip if less than expected duration
+                # Check duration (10 seconds = 2560 samples at 256Hz)
+                expected_samples = self.window_duration * self.target_sf
+                if clip.n_times < expected_samples:
                     window_start += self.window_duration
                     continue
                 
@@ -449,9 +575,7 @@ class AllWindowsExtractor:
     def extract_patient(self, patient_id):
         """
         Extract all windows for a single patient from both ictal and interictal files.
-        
-        Args:
-            patient_id: Patient identifier (e.g., 'sub-RID0106')
+        Variable channel counts across files are allowed.
         
         Returns:
             list of tuples: (signals, coords, regs, ch_names, label, metadata)
@@ -467,7 +591,8 @@ class AllWindowsExtractor:
                 os.path.join(
                     self.config.RAW_DATA_DIR,
                     patient_id,
-                    "ses-clinical01/ieeg",
+                    "ses-clinical01",
+                    "ieeg",
                     f"{patient_id}_ses-clinical01_task-ictal{int(seizure.start)}_*.edf"
                 )
             )
@@ -486,7 +611,8 @@ class AllWindowsExtractor:
         patient_dir = os.path.join(
             self.config.RAW_DATA_DIR,
             patient_id,
-            "ses-clinical01/ieeg"
+            "ses-clinical01",
+            "ieeg"
         )
         
         if os.path.exists(patient_dir):
@@ -500,21 +626,21 @@ class AllWindowsExtractor:
         
         return all_windows
     
-    def save_patient(self, patient_id, windows, output_dir):
+    def save_patient_npz(self, patient_id, windows, output_dir):
         """
-        Save a single patient's windows to an HDF5 file.
-        Handles variable channel counts by padding to max channels.
+        Save a single patient's windows to a compressed NPZ file.
+        Handles variable channel counts by padding to max_channels.
         
         Args:
             patient_id: Patient identifier
             windows: List of (signals, coords, regs, ch_names, label, metadata) tuples
-            output_dir: Directory to save patient HDF5 files
+            output_dir: Directory to save patient NPZ files
         """
         if len(windows) == 0:
             return
         
         # Create output file for this patient
-        output_file = os.path.join(output_dir, f"{patient_id}.h5")
+        output_file = os.path.join(output_dir, f"{patient_id}.npz")
         
         n_samples = len(windows)
         n_timesteps = windows[0][0].shape[1]
@@ -522,102 +648,81 @@ class AllWindowsExtractor:
         # Find maximum number of channels across all windows for this patient
         max_channels = max(w[0].shape[0] for w in windows)
         
-        with h5py.File(output_file, 'w') as f:
-            # Create datasets with max_channels
-            signals_dset = f.create_dataset(
-                'signals',
-                shape=(n_samples, max_channels, n_timesteps),
-                dtype='float16',  # Match make_dataset.py line 151
-                compression='gzip',
-                compression_opts=1
+        # Pre-allocate arrays with padding
+        signals_arr = np.zeros((n_samples, max_channels, n_timesteps), dtype=np.float16)
+        coords_arr = np.zeros((n_samples, max_channels, 3), dtype=np.float32)
+        regs_arr = np.zeros((n_samples, max_channels), dtype=np.int32)
+        n_channels_arr = np.zeros(n_samples, dtype=np.int32)
+        labels_arr = np.zeros(n_samples, dtype=np.int32)
+        
+        # Metadata lists
+        ch_names_list = []
+        window_info_list = []
+        
+        # Fill arrays (with padding if necessary)
+        for i, window in enumerate(windows):
+            signals, coords, regs, ch_names, label, metadata = window
+            
+            n_ch = signals.shape[0]
+            n_channels_arr[i] = n_ch
+            
+            # Store data (padded if necessary)
+            signals_arr[i, :n_ch, :] = signals
+            coords_arr[i, :n_ch, :] = coords
+            regs_arr[i, :n_ch] = regs
+            
+            labels_arr[i] = label
+            ch_names_list.append(json.dumps(ch_names))
+            window_info_list.append(json.dumps(metadata))
+        
+        # Save to compressed NPZ file
+        try:
+            np.savez_compressed(
+                output_file,
+                signals=signals_arr,
+                coords=coords_arr,
+                regs=regs_arr,
+                n_channels=n_channels_arr,
+                labels=labels_arr,
+                patient_id=patient_id,
+                ch_names=np.array(ch_names_list, dtype=object),
+                window_info=np.array(window_info_list, dtype=object)
             )
             
-            coords_dset = f.create_dataset(
-                'coords',
-                shape=(n_samples, max_channels, 3),
-                dtype='float32',
-                compression='gzip',
-                compression_opts=1
-            )
+            # Count ictal vs interictal
+            n_ictal = np.sum(labels_arr == 1)
+            n_interictal = np.sum(labels_arr == 0)
+            file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
             
-            regs_dset = f.create_dataset(
-                'regs',
-                shape=(n_samples, max_channels),
-                dtype='int32',
-                compression='gzip',
-                compression_opts=1
-            )
-            
-            # Store actual channel counts for each window
-            n_channels_dset = f.create_dataset(
-                'n_channels',
-                shape=(n_samples,),
-                dtype='int32'
-            )
-            
-            labels_dset = f.create_dataset(
-                'labels',
-                shape=(n_samples,),
-                dtype='int32'
-            )
-            
-            # Metadata
-            ch_names_list = []
-            window_info_list = []
-            
-            # Write windows (with padding if necessary)
-            for i, window in enumerate(windows):
-                signals, coords, regs, ch_names, label, metadata = window
-                
-                n_ch = signals.shape[0]
-                n_channels_dset[i] = n_ch
-                
-                # Pad if necessary
-                if n_ch < max_channels:
-                    # Pad with zeros
-                    padded_signals = np.zeros((max_channels, n_timesteps), dtype=np.float16)
-                    padded_signals[:n_ch, :] = signals
-                    
-                    padded_coords = np.zeros((max_channels, 3), dtype=np.float32)
-                    padded_coords[:n_ch, :] = coords
-                    
-                    padded_regs = np.zeros(max_channels, dtype=np.int32)
-                    padded_regs[:n_ch] = regs
-                    
-                    signals_dset[i] = padded_signals
-                    coords_dset[i] = padded_coords
-                    regs_dset[i] = padded_regs
-                else:
-                    signals_dset[i] = signals
-                    coords_dset[i] = coords
-                    regs_dset[i] = regs
-                
-                labels_dset[i] = label
-                ch_names_list.append(json.dumps(ch_names))
-                window_info_list.append(json.dumps(metadata))
-            
-            # Save metadata
-            f.create_dataset('patient_id', data=patient_id.encode('utf-8'), dtype=h5py.string_dtype())
-            f.create_dataset('ch_names', data=[s.encode('utf-8') for s in ch_names_list], dtype=h5py.string_dtype())
-            f.create_dataset('window_info', data=[s.encode('utf-8') for s in window_info_list], dtype=h5py.string_dtype())
+            print(f"  ✓ Saved {patient_id}.npz:")
+            print(f"    - Total windows: {n_samples}")
+            print(f"    - Ictal: {n_ictal}, Interictal: {n_interictal}")
+            print(f"    - Max channels: {max_channels}")
+            print(f"    - File size: {file_size_mb:.1f} MB")
+        except Exception as e:
+            print(f"  ✗ Error saving {patient_id}.npz: {e}")
     
-    def extract_all_to_directory(self, output_dir):
+    def extract_all_to_directory(self, output_dir, test_patient=None):
         """
-        Extract all windows for all patients and save one HDF5 file per patient.
-        This avoids memory issues by processing and saving one patient at a time.
+        Extract all windows for all patients (or single test patient) and save to NPZ files.
         
         Args:
-            output_dir: Directory to save per-patient HDF5 files
+            output_dir: Directory to save per-patient NPZ files
+            test_patient: If provided, only process this one patient (for testing)
         """
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
         # Get unique patients
-        unique_patients = self.sz_table['Patient'].unique()
+        if test_patient:
+            unique_patients = [test_patient]
+            print(f"\n*** TEST MODE: Processing single patient {test_patient} ***\n")
+        else:
+            unique_patients = self.sz_table['Patient'].unique()
         
-        print(f"\nExtracting windows from {len(unique_patients)} patients...")
+        print(f"Extracting windows from {len(unique_patients)} patient(s)...")
         print(f"Saving to directory: {output_dir}")
-        print(f"Format: One HDF5 file per patient\n")
+        print(f"Format: One compressed NPZ file per patient\n")
         
         total_windows = 0
         total_interictal = 0
@@ -625,14 +730,17 @@ class AllWindowsExtractor:
         patients_processed = 0
         
         for patient_id in tqdm(unique_patients, desc="Patients"):
+            # print(f"\nProcessing {patient_id}...")
+            
             # Extract windows for this patient
             windows = self.extract_patient(patient_id)
             
             if len(windows) == 0:
+                print(f"  No windows extracted for {patient_id}")
                 continue
             
             # Save immediately (frees memory)
-            self.save_patient(patient_id, windows, output_dir)
+            self.save_patient_npz(patient_id, windows, output_dir)
             
             # Count statistics
             n_interictal = sum(1 for w in windows if w[4] == 0)
@@ -645,38 +753,123 @@ class AllWindowsExtractor:
             
             # Windows are now freed from memory
         
-        print(f"\n✓ Extracted {total_windows} total windows")
+        print(f"\n{'='*60}")
+        print(f"✓ Extraction complete!")
         print(f"  Patients processed: {patients_processed}")
+        print(f"  Total windows: {total_windows}")
         print(f"  Interictal (label=0): {total_interictal}")
         print(f"  Ictal (label=1): {total_ictal}")
-        print(f"  Files saved: {output_dir}/*.h5")
+        print(f"  Files saved: {output_dir}/*.npz")
+        print(f"{'='*60}")
 
 
 def main():
-    """Extract all windows from all patients."""
+    """Extract all windows from all patients (or test on single patient)."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Extract all 10-second windows from iEEG data',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Compute global statistics (run once)
+  python extract_all_windows.py --compute-global-stats
+
+  # Extract with per-channel normalization (default)
+  python extract_all_windows.py
+  
+  # Extract with global normalization
+  python extract_all_windows.py --use-global-norm
+  
+  # Test on single patient
+  python extract_all_windows.py --test-patient sub-RID0106
+        """
+    )
+    parser.add_argument(
+        '--test-patient',
+        type=str,
+        default=None,
+        help='Test on a single patient (e.g., sub-RID0106)'
+    )
+    parser.add_argument(
+        '--compute-global-stats',
+        action='store_true',
+        help='Compute global mean/std from 200 random EDF files and save to file (run once)'
+    )
+    parser.add_argument(
+        '--n-files-for-stats',
+        type=int,
+        default=200,
+        help='Number of EDF files to sample for global statistics (default: 200)'
+    )
+    parser.add_argument(
+        '--use-global-norm',
+        action='store_true',
+        help='Use global normalization instead of per-channel normalization'
+    )
+    parser.add_argument(
+        '--output-suffix',
+        type=str,
+        default='',
+        help='Suffix for output directory (e.g., "_global_norm")'
+    )
+    args = parser.parse_args()
+    
     print("="*60)
     print("Extract All Windows - All Patients")
     print("Using make_dataset.py preprocessing pipeline")
+    print("Saving as compressed NPZ files")
     print("="*60)
     
     # Create config and directories
     config = BenchmarkConfig()
     config.create_directories()
     
-    # Create extractor
-    extractor = AllWindowsExtractor(config)
-    
-    # Output directory for per-patient HDF5 files
-    output_dir = os.path.join(
+    # Global statistics file path
+    global_stats_file = os.path.join(
         config.OUTPUT_DATA_DIR,
-        "all_windows_per_patient"
+        "global_normalization_stats.json"
     )
     
-    # Extract and save per-patient
-    extractor.extract_all_to_directory(output_dir)
+    # Mode 1: Compute global statistics
+    if args.compute_global_stats:
+        print("\n*** MODE: Computing Global Statistics ***\n")
+        extractor = AllWindowsExtractor(config, use_global_norm=False)
+        extractor.compute_global_stats(
+            n_files=args.n_files_for_stats,
+            output_file=global_stats_file
+        )
+        print(f"\n✓ Statistics saved to: {global_stats_file}")
+        print(f"\nTo extract windows with global normalization, run:")
+        print(f"  python extract_all_windows.py --use-global-norm")
+        return
     
-    print("\n✓ Extraction complete!")
-    print(f"✓ Per-patient HDF5 files saved to: {output_dir}")
+    # Mode 2: Extract windows
+    print(f"\n*** MODE: Extracting Windows ***")
+    print(f"Normalization: {'Global' if args.use_global_norm else 'Per-channel'}\n")
+    
+    # Create extractor
+    extractor = AllWindowsExtractor(
+        config,
+        use_global_norm=args.use_global_norm,
+        global_stats_file=global_stats_file if args.use_global_norm else None
+    )
+    
+    # Output directory for per-patient NPZ files
+    output_dir_name = "all_windows_per_patient"
+    if args.output_suffix:
+        output_dir_name += args.output_suffix
+    elif args.use_global_norm:
+        output_dir_name += "_global_norm"
+    
+    output_dir = os.path.join(config.OUTPUT_DATA_DIR, output_dir_name)
+    
+    print(f"Output directory: {output_dir}\n")
+    
+    # Extract and save per-patient (or single test patient)
+    extractor.extract_all_to_directory(output_dir, test_patient=args.test_patient)
+    
+    print(f"\n✓ Per-patient NPZ files saved to: {output_dir}")
 
 
 if __name__ == "__main__":
