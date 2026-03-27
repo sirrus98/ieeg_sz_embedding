@@ -168,4 +168,14 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-data/all_windows_per_patient/
+data/
+CNT_iEEG_BIDS_local/
+csv_logs/
+wandb_logs/
+wandb/
+review/
+lightning_logs/
+benchmark_logs/
+*.ckpt
+*.npz
+*.pth

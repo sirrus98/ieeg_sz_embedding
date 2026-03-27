@@ -9,10 +9,12 @@ This script follows the EXACT preprocessing pipeline from code/make_dataset.py:
 5. Apply bandpass filter (0.5-120Hz, order=10) using bandpass_filter()
 6. Apply bipolar montage using bipolar_montage()
 7. Resample to 256Hz using resample_poly()
-8. Per-channel z-score normalization: (x - nanmean(x)) / nanstd(x)
-9. Match channels to master_bipolars annotations
-10. Filter to valid regions from unique_regs.csv
-11. Convert to float16
+8. Match channels to master_bipolars annotations
+9. Filter to valid regions from unique_regs.csv
+10. PER-PATIENT normalization: After all windows are collected for a patient,
+   compute mean and std across ALL channels and ALL windows, then normalize:
+   z = (x - patient_mean) / patient_std
+11. Keep as float32 (no float16 conversion)
 
 Window Extraction:
 - Ictal files: Pre-ictal (0-30s) = interictal (0), During seizure = ictal (1), Post-ictal = interictal (0)
@@ -37,21 +39,23 @@ from utils import check_channel_types, clean_labels, notch_filter, bandpass_filt
 
 
 class AllWindowsExtractor:
-    """Extract all possible 10-second windows from EDF files using make_dataset.py preprocessing."""
+    """
+    Extract all possible 10-second windows from EDF files using make_dataset.py preprocessing.
     
-    def __init__(self, config=BenchmarkConfig, use_global_norm=False, global_stats_file=None):
+    Applies PER-PATIENT normalization: computes mean/std across all channels and windows 
+    for each patient, avoiding the need to reload EDF files.
+    """
+    
+    def __init__(self, config=BenchmarkConfig):
         """
         Initialize the extractor.
         
         Args:
             config: BenchmarkConfig instance
-            use_global_norm: If True, use global mean/std for normalization. If False, use per-channel.
-            global_stats_file: Path to precomputed global statistics file (JSON)
         """
         self.config = config
         self.target_sf = config.TARGET_SAMPLING_RATE
         self.window_duration = 10  # seconds
-        self.use_global_norm = use_global_norm
         
         # Load metadata
         self._load_metadata()
@@ -59,20 +63,8 @@ class AllWindowsExtractor:
         # Load annotations and region mappings
         self._load_annotations()
         
-        # Load or compute global statistics if needed
-        if use_global_norm:
-            if global_stats_file and os.path.exists(global_stats_file):
-                self.global_stats = self._load_global_stats(global_stats_file)
-                print(f"✓ Loaded global statistics from {global_stats_file}")
-            else:
-                print(f"✗ Global normalization requested but stats file not found: {global_stats_file}")
-                print(f"  Please run: python extract_all_windows.py --compute-global-stats")
-                raise FileNotFoundError(f"Global stats file not found: {global_stats_file}")
-        else:
-            self.global_stats = None
-        
         print(f"✓ Initialization complete")
-        print(f"  Normalization mode: {'Global' if use_global_norm else 'Per-channel'}")
+        print(f"  Normalization mode: Per-patient (across all channels and windows)")
     
     def _load_metadata(self):
         """Load seizure metadata and patient mappings (from make_dataset.py lines 22-26)."""
@@ -334,18 +326,16 @@ class AllWindowsExtractor:
         
         return stats
     
-    def _match_channels_and_normalize(self, clip, patient_id):
+    def _match_channels_no_normalize(self, clip, patient_id):
         """
-        Match channels to annotations, filter to valid regions, and normalize.
-        From make_dataset.py lines 126-161.
-        
-        Supports both per-channel and global normalization.
+        Match channels to annotations and filter to valid regions WITHOUT normalization.
+        Normalization will be applied per-patient after all windows are collected.
         
         Returns:
             tuple: (clip_data, clip_coords, clip_reg_idx, ch_names) or (None, None, None, None)
         """
         try:
-            # Step 9: Get corresponding rows of master bipolars (lines 126-128)
+            # Get corresponding rows of master bipolars
             pt_bipolars = self.master_bipolars.loc[
                 self.master_bipolars.index == patient_id
             ].copy()
@@ -353,12 +343,12 @@ class AllWindowsExtractor:
             if len(pt_bipolars) == 0:
                 return None, None, None, None
             
-            # Keep rows that have name in clip.ch_names (lines 136-138)
+            # Keep rows that have name in clip.ch_names
             pt_bipolars = pt_bipolars.loc[
                 pt_bipolars.name.isin(clip.ch_names)
             ].copy()
             
-            # Filter to valid regions (lines 139-141)
+            # Filter to valid regions
             pt_bipolars = pt_bipolars.loc[
                 pt_bipolars.reg.isin(self.regs.reg)
             ]
@@ -366,29 +356,17 @@ class AllWindowsExtractor:
             if len(pt_bipolars) == 0:
                 return None, None, None, None
             
-            # Step 10: Apply normalization (line 145)
-            if self.use_global_norm:
-                # Global normalization: (x - global_mean) / global_std (vectorized)
-                clip = clip.apply_function(
-                    lambda x: (x - self.global_stats['mean']) / self.global_stats['std'],
-                    n_jobs=1
-                )
-            else:
-                # Per-channel z-score normalization (original method)
-                clip = clip.apply_function(lambda x: (x - np.nanmean(x)) / np.nanstd(x))
-            
-            # Make sure clip has same channels as pt_bipolars (line 148)
-            # Use pick() instead of legacy pick_channels() to avoid warnings
+            # Make sure clip has same channels as pt_bipolars
             clip = clip.pick(pt_bipolars.name.to_list())
             
-            # Step 11: Convert to float16 (line 151)
-            clip_data = clip.get_data().astype(np.float16)
+            # Get data as float32 (NO normalization yet, NO float16 conversion)
+            clip_data = clip.get_data().astype(np.float32)
             clip_coords = pt_bipolars[["mni_x", "mni_y", "mni_z"]].values
             clip_reg = pt_bipolars["reg"].values
             
             ch_names = clip.ch_names
             
-            # Filter to valid regions (lines 157-161)
+            # Filter to valid regions
             clip_data = clip_data[np.isin(clip_reg, self.regs.reg.values)]
             clip_coords = clip_coords[np.isin(clip_reg, self.regs.reg.values)]
             clip_reg = clip_reg[np.isin(clip_reg, self.regs.reg.values)]
@@ -467,8 +445,8 @@ class AllWindowsExtractor:
                     window_start += self.window_duration
                     continue
                 
-                # Match channels and normalize
-                clip_data, clip_coords, clip_reg_idx, ch_names = self._match_channels_and_normalize(
+                # Match channels (no normalization yet)
+                clip_data, clip_coords, clip_reg_idx, ch_names = self._match_channels_no_normalize(
                     clip, patient_id
                 )
                 
@@ -488,7 +466,7 @@ class AllWindowsExtractor:
                 }
                 
                 windows.append((
-                    clip_data,  # Already float16
+                    clip_data,  # float32, not normalized yet
                     clip_coords.astype(np.float32),
                     clip_reg_idx.astype(np.int32),
                     ch_names.tolist() if isinstance(ch_names, np.ndarray) else ch_names,
@@ -537,8 +515,8 @@ class AllWindowsExtractor:
                     window_start += self.window_duration
                     continue
                 
-                # Match channels and normalize
-                clip_data, clip_coords, clip_reg_idx, ch_names = self._match_channels_and_normalize(
+                # Match channels (no normalization yet)
+                clip_data, clip_coords, clip_reg_idx, ch_names = self._match_channels_no_normalize(
                     clip, patient_id
                 )
                 
@@ -576,6 +554,8 @@ class AllWindowsExtractor:
         """
         Extract all windows for a single patient from both ictal and interictal files.
         Variable channel counts across files are allowed.
+        
+        After extraction, applies per-patient normalization across ALL channels and windows.
         
         Returns:
             list of tuples: (signals, coords, regs, ch_names, label, metadata)
@@ -624,7 +604,59 @@ class AllWindowsExtractor:
                 windows = self._extract_windows_from_interictal(edf_file, patient_id)
                 all_windows.extend(windows)
         
+        # Apply per-patient normalization AFTER all windows are collected
+        if len(all_windows) > 0:
+            all_windows = self._normalize_patient_windows(all_windows, patient_id)
+        
         return all_windows
+    
+    def _normalize_patient_windows(self, windows, patient_id):
+        """
+        Apply per-patient normalization across all channels and windows.
+        
+        Computes mean and std from ALL signal values across ALL windows for this patient,
+        then normalizes: z = (x - mean) / std
+        
+        Args:
+            windows: List of (signals, coords, regs, ch_names, label, metadata) tuples
+            patient_id: Patient identifier
+        
+        Returns:
+            Normalized windows (same structure)
+        """
+        # Collect all signal values from all windows
+        all_signals = []
+        for signals, _, _, _, _, _ in windows:
+            all_signals.append(signals.flatten())
+        
+        # Concatenate all signals and compute patient-level statistics
+        all_signals_concat = np.concatenate(all_signals)
+        patient_mean = np.nanmean(all_signals_concat)
+        patient_std = np.nanstd(all_signals_concat)
+        
+        # Avoid division by zero
+        if patient_std == 0 or np.isnan(patient_std):
+            patient_std = 1.0
+        
+        # Normalize all windows using patient-level statistics
+        normalized_windows = []
+        for signals, coords, regs, ch_names, label, metadata in windows:
+            # Apply normalization: (x - mean) / std
+            normalized_signals = (signals - patient_mean) / patient_std
+            
+            # Replace NaN with 0
+            normalized_signals = np.nan_to_num(normalized_signals, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            normalized_windows.append((
+                normalized_signals.astype(np.float32),
+                coords,
+                regs,
+                ch_names,
+                label,
+                metadata
+            ))
+        
+        return normalized_windows
     
     def save_patient_npz(self, patient_id, windows, output_dir):
         """
@@ -648,8 +680,8 @@ class AllWindowsExtractor:
         # Find maximum number of channels across all windows for this patient
         max_channels = max(w[0].shape[0] for w in windows)
         
-        # Pre-allocate arrays with padding
-        signals_arr = np.zeros((n_samples, max_channels, n_timesteps), dtype=np.float16)
+        # Pre-allocate arrays with padding (using float32, not float16)
+        signals_arr = np.zeros((n_samples, max_channels, n_timesteps), dtype=np.float32)
         coords_arr = np.zeros((n_samples, max_channels, 3), dtype=np.float32)
         regs_arr = np.zeros((n_samples, max_channels), dtype=np.int32)
         n_channels_arr = np.zeros(n_samples, dtype=np.int32)
@@ -768,21 +800,18 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Extract all 10-second windows from iEEG data',
+        description='Extract all 10-second windows from iEEG data with per-patient normalization',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Compute global statistics (run once)
-  python extract_all_windows.py --compute-global-stats
-
-  # Extract with per-channel normalization (default)
+  # Extract all patients with per-patient normalization (default)
   python extract_all_windows.py
-  
-  # Extract with global normalization
-  python extract_all_windows.py --use-global-norm
   
   # Test on single patient
   python extract_all_windows.py --test-patient sub-RID0106
+  
+  # Specify custom output directory
+  python extract_all_windows.py --output-dir data/my_custom_dir
         """
     )
     parser.add_argument(
@@ -792,79 +821,33 @@ Examples:
         help='Test on a single patient (e.g., sub-RID0106)'
     )
     parser.add_argument(
-        '--compute-global-stats',
-        action='store_true',
-        help='Compute global mean/std from 200 random EDF files and save to file (run once)'
-    )
-    parser.add_argument(
-        '--n-files-for-stats',
-        type=int,
-        default=200,
-        help='Number of EDF files to sample for global statistics (default: 200)'
-    )
-    parser.add_argument(
-        '--use-global-norm',
-        action='store_true',
-        help='Use global normalization instead of per-channel normalization'
-    )
-    parser.add_argument(
-        '--output-suffix',
+        '--output-dir',
         type=str,
-        default='',
-        help='Suffix for output directory (e.g., "_global_norm")'
+        default=None,
+        help='Custom output directory (default: data/all_windows_per_patient_perpatient)'
     )
     args = parser.parse_args()
     
     print("="*60)
     print("Extract All Windows - All Patients")
-    print("Using make_dataset.py preprocessing pipeline")
-    print("Saving as compressed NPZ files")
+    print("Per-Patient Normalization (across all channels and windows)")
+    print("Float32 precision (no float16 conversion)")
     print("="*60)
     
     # Create config and directories
     config = BenchmarkConfig()
     config.create_directories()
     
-    # Global statistics file path
-    global_stats_file = os.path.join(
-        config.OUTPUT_DATA_DIR,
-        "global_normalization_stats.json"
-    )
-    
-    # Mode 1: Compute global statistics
-    if args.compute_global_stats:
-        print("\n*** MODE: Computing Global Statistics ***\n")
-        extractor = AllWindowsExtractor(config, use_global_norm=False)
-        extractor.compute_global_stats(
-            n_files=args.n_files_for_stats,
-            output_file=global_stats_file
-        )
-        print(f"\n✓ Statistics saved to: {global_stats_file}")
-        print(f"\nTo extract windows with global normalization, run:")
-        print(f"  python extract_all_windows.py --use-global-norm")
-        return
-    
-    # Mode 2: Extract windows
-    print(f"\n*** MODE: Extracting Windows ***")
-    print(f"Normalization: {'Global' if args.use_global_norm else 'Per-channel'}\n")
-    
     # Create extractor
-    extractor = AllWindowsExtractor(
-        config,
-        use_global_norm=args.use_global_norm,
-        global_stats_file=global_stats_file if args.use_global_norm else None
-    )
+    extractor = AllWindowsExtractor(config)
     
     # Output directory for per-patient NPZ files
-    output_dir_name = "all_windows_per_patient"
-    if args.output_suffix:
-        output_dir_name += args.output_suffix
-    elif args.use_global_norm:
-        output_dir_name += "_global_norm"
+    if args.output_dir:
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.join(config.OUTPUT_DATA_DIR, "all_windows_per_patient_perpatient")
     
-    output_dir = os.path.join(config.OUTPUT_DATA_DIR, output_dir_name)
-    
-    print(f"Output directory: {output_dir}\n")
+    print(f"\nOutput directory: {output_dir}\n")
     
     # Extract and save per-patient (or single test patient)
     extractor.extract_all_to_directory(output_dir, test_patient=args.test_patient)

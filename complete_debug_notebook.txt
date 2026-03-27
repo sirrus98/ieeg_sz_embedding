@@ -1,0 +1,209 @@
+REMAINING CELLS FOR DEBUG NOTEBOOK (Cells 10-34)
+
+This file documents the remaining cells to add to the notebook.
+You have successfully created cells 0-9.
+
+=== SECTION 3: STATISTICAL ANALYSIS (Cells 10-16) ===
+
+Cell 10 (markdown):
+## 3. Statistical Analysis by Label
+
+Cell 11 (code):
+# Compute statistics for each window
+print("Computing statistics for all windows...")
+
+window_stats = []
+
+for i in range(len(all_signals)):
+    signals = all_signals[i]
+    n_ch = int(all_n_channels[i])
+    label = all_labels[i]
+    patient_id = all_patient_ids[i]
+    
+    # Only use actual channels (exclude padding)
+    signals = signals[:n_ch]
+    
+    # Compute statistics per window (averaged across channels)
+    signal_range = np.nanmax(signals) - np.nanmin(signals)
+    signal_std = np.nanstd(signals)
+    signal_mean = np.nanmean(signals)
+    
+    # Line length: mean of absolute differences (measures signal complexity)
+    line_lengths = []
+    for ch in range(n_ch):
+        ll = np.mean(np.abs(np.diff(signals[ch])))
+        line_lengths.append(ll)
+    mean_line_length = np.mean(line_lengths)
+    
+    window_stats.append({
+        'window_idx': i,
+        'patient_id': patient_id,
+        'label': label,
+        'label_name': 'ictal' if label == 1 else 'interictal',
+        'n_channels': n_ch,
+        'range': signal_range,
+        'std': signal_std,
+        'mean': signal_mean,
+        'line_length': mean_line_length
+    })
+
+stats_df = pd.DataFrame(window_stats)
+
+print(f"✓ Statistics computed for {len(stats_df)} windows")
+print("\nStatistics summary:")
+print(stats_df.groupby('label_name')[['range', 'std', 'line_length']].describe())
+
+Cell 12 (code):
+# Statistical significance tests
+ictal_stats = stats_df[stats_df['label'] == 1]
+interictal_stats = stats_df[stats_df['label'] == 0]
+
+print("\nStatistical Significance Tests (Mann-Whitney U):")
+print("="*60)
+
+for metric in ['range', 'std', 'line_length']:
+    ictal_vals = ictal_stats[metric].values
+    interictal_vals = interictal_stats[metric].values
+    
+    # Mann-Whitney U test (non-parametric)
+    statistic, p_value = stats.mannwhitneyu(ictal_vals, interictal_vals, alternative='two-sided')
+    
+    # Effect size (Cohen's d)
+    mean_diff = np.mean(ictal_vals) - np.mean(interictal_vals)
+    pooled_std = np.sqrt((np.std(ictal_vals)**2 + np.std(interictal_vals)**2) / 2)
+    cohens_d = mean_diff / pooled_std
+    
+    significance = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else "ns"
+    
+    print(f"\n{metric.upper()}:")
+    print(f"  Ictal mean: {np.mean(ictal_vals):.6f} ± {np.std(ictal_vals):.6f}")
+    print(f"  Interictal mean: {np.mean(interictal_vals):.6f} ± {np.std(interictal_vals):.6f}")
+    print(f"  p-value: {p_value:.2e} {significance}")
+    print(f"  Cohen's d: {cohens_d:.3f}")
+
+Cell 13 (markdown):
+## 4. Statistical Visualizations
+
+Cell 14 (code):
+# Box plots comparing statistics by label
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+metrics = ['range', 'std', 'line_length']
+titles = ['Signal Range', 'Signal Standard Deviation', 'Mean Line Length']
+
+for ax, metric, title in zip(axes, metrics, titles):
+    sns.boxplot(data=stats_df, x='label_name', y=metric, ax=ax)
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_xlabel('Label', fontsize=11)
+    ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=11)
+    ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig('debug_stats_boxplots_perpatient.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("✓ Box plots created")
+
+Cell 15 (code):
+# Scatter plots: std vs range, colored by label
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Std vs Range
+for label_name, color in [('ictal', 'red'), ('interictal', 'blue')]:
+    data = stats_df[stats_df['label_name'] == label_name]
+    axes[0].scatter(data['std'], data['range'], alpha=0.5, label=label_name, 
+                   color=color, s=30, edgecolors='none')
+
+axes[0].set_xlabel('Standard Deviation', fontsize=11)
+axes[0].set_ylabel('Range', fontsize=11)
+axes[0].set_title('Standard Deviation vs Range by Label', fontsize=12, fontweight='bold')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# Line Length vs Std
+for label_name, color in [('ictal', 'red'), ('interictal', 'blue')]:
+    data = stats_df[stats_df['label_name'] == label_name]
+    axes[1].scatter(data['std'], data['line_length'], alpha=0.5, label=label_name,
+                   color=color, s=30, edgecolors='none')
+
+axes[1].set_xlabel('Standard Deviation', fontsize=11)
+axes[1].set_ylabel('Line Length', fontsize=11)
+axes[1].set_title('Line Length vs Standard Deviation by Label', fontsize=12, fontweight='bold')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('debug_stats_scatter_perpatient.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("✓ Scatter plots created")
+
+Cell 16 (code):
+# Histograms of line length distributions
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+for i, (metric, title) in enumerate([('range', 'Range'), ('std', 'Std'), ('line_length', 'Line Length')]):
+    ictal_data = stats_df[stats_df['label'] == 1][metric]
+    interictal_data = stats_df[stats_df['label'] == 0][metric]
+    
+    axes[i].hist(ictal_data, bins=30, alpha=0.6, label='Ictal', color='red', edgecolor='black')
+    axes[i].hist(interictal_data, bins=30, alpha=0.6, label='Interictal', color='blue', edgecolor='black')
+    
+    axes[i].set_xlabel(title, fontsize=11)
+    axes[i].set_ylabel('Frequency', fontsize=11)
+    axes[i].set_title(f'{title} Distribution by Label', fontsize=12, fontweight='bold')
+    axes[i].legend()
+    axes[i].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.savefig('debug_stats_histograms_perpatient.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("✓ Histograms created")
+
+=== SECTION 4: LINE LENGTH VISUALIZATION (Cells 17-18) ===
+
+Cell 17 (markdown):
+## 5. Line Length Visualization Across Windows
+
+Cell 18 (code):
+# Line length scatter plot by window index, colored by label
+fig, axes = plt.subplots(len(selected_patients), 1, figsize=(16, 4*len(selected_patients)))
+
+if len(selected_patients) == 1:
+    axes = [axes]
+
+for i, patient_id in enumerate(selected_patients):
+    patient_data = stats_df[stats_df['patient_id'] == patient_id]
+    
+    # Plot by label
+    for label, label_name, color in [(0, 'interictal', 'blue'), (1, 'ictal', 'red')]:
+        label_data = patient_data[patient_data['label'] == label]
+        axes[i].scatter(label_data['window_idx'], label_data['line_length'], 
+                       alpha=0.6, label=label_name, color=color, s=40)
+    
+    # Add mean lines
+    ictal_mean = patient_data[patient_data['label'] == 1]['line_length'].mean()
+    interictal_mean = patient_data[patient_data['label'] == 0]['line_length'].mean()
+    
+    axes[i].axhline(ictal_mean, color='red', linestyle='--', linewidth=2, 
+                   label=f'Ictal mean: {ictal_mean:.6f}', alpha=0.7)
+    axes[i].axhline(interictal_mean, color='blue', linestyle='--', linewidth=2,
+                   label=f'Interictal mean: {interictal_mean:.6f}', alpha=0.7)
+    
+    axes[i].set_xlabel('Window Index', fontsize=11)
+    axes[i].set_ylabel('Line Length', fontsize=11)
+    axes[i].set_title(f'Line Length Across Windows - {patient_id}', fontsize=12, fontweight='bold')
+    axes[i].legend(loc='upper right')
+    axes[i].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('debug_line_length_by_window_perpatient.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("✓ Line length visualization created")
+
+===END OF FILE===
+
+NOTE: Continue with CNN training sections (cells 19-34) in separate file or add manually.
+The remaining cells follow the same pattern from the original plan.

@@ -313,9 +313,9 @@ class InterictalExtractor:
                 max_start = total_duration - self.window_duration
                 start_time = np.random.uniform(0, max_start)
                 
-                    result = self._extract_window(edf_file, start_time, patient_id)
-                    if result is not None:
-                        patient_windows.append(result)
+                result = self._extract_window(edf_file, start_time, patient_id)
+                if result is not None:
+                    patient_windows.append(result)
                     
                 # Stop if we have enough windows for this patient
                 if len(patient_windows) >= self.windows_per_patient:

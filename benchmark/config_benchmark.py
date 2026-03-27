@@ -14,33 +14,33 @@ from pathlib import Path
 class BenchmarkConfig:
     """Configuration for benchmark experiments."""
     
-    # ===== PATHS - UPDATE THESE FOR YOUR ENVIRONMENT =====
-    # Data directory containing preprocessed seizure data (READ-ONLY - from pattnaik)
-    DATA_DIR = "/mnt/leif/littlab/users/pattnaik/ieeg_sz_embedding/data"
+    # ===== PATHS - LOCAL CONFIGURATION =====
+    # Base directory (current working directory is the project root)
+    BASE_DIR = Path(__file__).parent.parent.resolve()
     
-    # Output directory for saving generated data (WRITE - to zcxu)
-    OUTPUT_DATA_DIR = "/mnt/leif/littlab/users/zcxu/ieeg_sz_embedding/data"
+    # Data directory containing preprocessed seizure data
+    DATA_DIR = str(BASE_DIR / "data")
     
-    # Raw BIDS data directory for extracting interictal windows
-    RAW_DATA_DIR = "/mnt/leif/littlab/data/Human_Data/CNT_iEEG_BIDS"
+    # Output directory for saving generated data
+    OUTPUT_DATA_DIR = str(BASE_DIR / "data")
     
-    # Checkpoint directory for pretrained models
-    PRETRAINED_CKPT_DIR = "/mnt/leif/littlab/users/pattnaik/ieeg_sz_embedding/checkpoints"
+    # Raw BIDS data directory for extracting interictal windows (local copy)
+    RAW_DATA_DIR = str(BASE_DIR / "CNT_iEEG_BIDS_local")
     
-    # Checkpoint directory for saving benchmark models
-    BENCHMARK_CKPT_DIR = "./benchmark_checkpoints"
+    # Checkpoint directory for saving benchmark models (not used - training from scratch)
+    BENCHMARK_CKPT_DIR = str(BASE_DIR / "benchmark_checkpoints")
     
     # Logs directory
-    LOGS_DIR = "./benchmark_logs"
+    LOGS_DIR = str(BASE_DIR / "benchmark_logs")
     
     # Output directory for embeddings
-    EMBEDDINGS_DIR = "./benchmark_embeddings"
+    EMBEDDINGS_DIR = str(BASE_DIR / "benchmark_embeddings")
     
     # ===== DATA FILES =====
-    # Ictal (seizure) data - 10 second windows (READ from pattnaik)
+    # Ictal (seizure) data - 10 second windows
     ICTAL_DATA_FILE = os.path.join(DATA_DIR, "all_sz_coords_data_spatiotemporal_regs_10s.pkl")
     
-    # Interictal (non-seizure) data - will be created by extract_interictal_data.py (WRITE to zcxu)
+    # Interictal (non-seizure) data - will be created by extract_interictal_data.py
     INTERICTAL_DATA_FILE = os.path.join(OUTPUT_DATA_DIR, "all_interictal_coords_data_spatiotemporal_regs_10s.pkl")
     
     # Metadata files
@@ -50,23 +50,23 @@ class BenchmarkConfig:
     DKT_MAPPING_FILE = os.path.join(DATA_DIR, "atlases/luts/dktg_reordered.csv")
     
     # ===== MODEL CONFIGURATION =====
-    # Pretrained model checkpoint (set to None to train from scratch)
-    PRETRAINED_CHECKPOINT = None  # e.g., "checkpoints_10s/model_epoch-100-train_loss-0.12345.ckpt"
+    # Training from scratch (no pretrained checkpoints)
+    PRETRAINED_CHECKPOINT = None
     
-    # Whether to freeze encoder during fine-tuning
-    FREEZE_ENCODER = False  # Set to True for feature extraction mode
+    # Encoder freezing (not applicable when training from scratch)
+    FREEZE_ENCODER = False
     
     # ===== TRAINING HYPERPARAMETERS =====
     # General
     BATCH_SIZE = 32
-    NUM_WORKERS = 4
+    NUM_WORKERS = 0
     RANDOM_SEED = 42
     
     # Optimization
-    LEARNING_RATE = 1e-4  # Lower than self-supervised (1e-2) for fine-tuning
+    LEARNING_RATE = 1e-3  # Lower than self-supervised (1e-2) for fine-tuning
     WEIGHT_DECAY = 1e-5
     MAX_EPOCHS = 100
-    EARLY_STOPPING_PATIENCE = 15
+    EARLY_STOPPING_PATIENCE = 25
     
     # Learning rate scheduler
     LR_SCHEDULER = "ReduceLROnPlateau"
@@ -130,11 +130,12 @@ if __name__ == "__main__":
     config = BenchmarkConfig()
     config.create_directories()
     
-    print("\n===== Benchmark Configuration =====")
+    print("\n===== Benchmark Configuration (Local) =====")
+    print(f"Base directory: {config.BASE_DIR}")
     print(f"Data directory: {config.DATA_DIR}")
     print(f"Raw data directory: {config.RAW_DATA_DIR}")
     print(f"Batch size: {config.BATCH_SIZE}")
     print(f"Learning rate: {config.LEARNING_RATE}")
     print(f"Max epochs: {config.MAX_EPOCHS}")
     print(f"Input shape: ({config.CHANNEL_BUFFER_SIZE}, {config.INPUT_TIMESTEPS})")
-    print("\nNote: Update paths in config_benchmark.py to match your environment!")
+    print("\nUsing local data paths. Training from scratch (no pretrained checkpoints).")

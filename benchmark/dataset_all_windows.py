@@ -1,7 +1,7 @@
 """
-PyTorch Dataset for lazy-loading windows from HDF5 file.
+PyTorch Dataset for lazy-loading windows from NPZ files.
 
-This dataset loads windows on-the-fly from an HDF5 file, avoiding loading
+This dataset loads windows on-the-fly using memory-mapped NPZ files, avoiding loading
 the entire dataset into memory at once.
 
 Data is already preprocessed and normalized during extraction (following make_dataset.py):
@@ -12,14 +12,13 @@ Data is already preprocessed and normalized during extraction (following make_da
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
-import h5py
 import numpy as np
 import json
 
 
-class HDF5WindowDataset(Dataset):
+class NPZWindowDataset(Dataset):
     """
-    PyTorch Dataset that lazy-loads windows from per-patient HDF5 files.
+    PyTorch Dataset that lazy-loads windows from per-patient NPZ files using memory mapping.
     
     Each window contains:
     - signals: (n_channels, n_timesteps) EEG data
@@ -29,82 +28,151 @@ class HDF5WindowDataset(Dataset):
     - metadata: patient_id, channel_names, window_info
     """
     
-    def __init__(self, h5_dir_path, transform=None, return_metadata=False):
+    def __init__(self, npz_dir_path, transform=None, return_metadata=False, use_mmap=True):
         """
-        Initialize the dataset from a directory of per-patient HDF5 files.
+        Initialize the dataset from a directory of per-patient NPZ files.
         
         Note: Data is already normalized during extraction (per-channel z-score).
         Additional transforms should not include normalization.
         
         Args:
-            h5_dir_path: Path to directory containing per-patient HDF5 files
+            npz_dir_path: Path to directory containing per-patient NPZ files
             transform: Optional transform to apply to signals (e.g., augmentation)
             return_metadata: If True, return metadata dict with each sample
+            use_mmap: If True, use memory mapping (lazy loading). If False, load all data into RAM.
         """
-        self.h5_dir_path = h5_dir_path
+        self.npz_dir_path = npz_dir_path
         self.transform = transform
         self.return_metadata = return_metadata
+        self.use_mmap = use_mmap
         
-        # Find all patient HDF5 files
+        # Find all patient NPZ files
         from glob import glob
-        self.patient_files = sorted(glob(os.path.join(h5_dir_path, "*.h5")))
+        self.patient_files = sorted(glob(os.path.join(npz_dir_path, "*.npz")))
         
         if len(self.patient_files) == 0:
-            raise ValueError(f"No HDF5 files found in {h5_dir_path}")
+            raise ValueError(f"No NPZ files found in {npz_dir_path}")
         
-        print(f"Loading HDF5 dataset from directory: {h5_dir_path}")
+        print(f"Loading NPZ dataset from directory: {npz_dir_path}")
         print(f"  Found {len(self.patient_files)} patient files")
         
-        # Build index: map global index to (patient_file_idx, window_idx_in_file)
-        self.index_map = []  # List of (file_idx, window_idx) tuples
-        self.patient_ids = []
-        
+        # First pass: collect window counts and metadata
+        window_counts = []
+        patient_id_list = []
         total_interictal = 0
         total_ictal = 0
         
         for file_idx, patient_file in enumerate(self.patient_files):
-            with h5py.File(patient_file, 'r') as f:
-                n_windows = f['signals'].shape[0]
-                patient_id = f['patient_id'][()].decode('utf-8')
-                
-                # Add entries to index map
-                for window_idx in range(n_windows):
-                    self.index_map.append((file_idx, window_idx))
-                    self.patient_ids.append(patient_id)
-                
-                # Count labels
-                labels = f['labels'][:]
-                total_interictal += np.sum(labels == 0)
-                total_ictal += np.sum(labels == 1)
+            # Load with mmap_mode='r' for memory-mapped reading (no data loaded into RAM)
+            data = np.load(patient_file, mmap_mode='r', allow_pickle=True)
+            n_windows = data['signals'].shape[0]
+            patient_id = str(data['patient_id'])
+            
+            window_counts.append(n_windows)
+            patient_id_list.append(patient_id)
+            
+            # Count labels (only loads the labels array, not the full data)
+            labels = data['labels']
+            total_interictal += np.sum(labels == 0)
+            total_ictal += np.sum(labels == 1)
+        
+        # Build index map efficiently (vectorized)
+        # Pre-allocate arrays instead of repeated appends
+        total_windows = sum(window_counts)
+        
+        # Use numpy for efficient index generation
+        file_indices = np.repeat(np.arange(len(self.patient_files)), window_counts)
+        window_indices = np.concatenate([np.arange(count) for count in window_counts])
+        
+        # Store as list of tuples (required for indexing)
+        self.index_map = list(zip(file_indices.tolist(), window_indices.tolist()))
+        
+        # Replicate patient IDs efficiently using numpy repeat
+        # Convert to array, repeat, then back to list (much faster than list comprehension)
+        patient_id_array = np.array(patient_id_list, dtype=object)
+        self.patient_ids = np.repeat(patient_id_array, window_counts).tolist()
         
         self.length = len(self.index_map)
         
+        # Store label counts for class weight calculation
+        self.label_counts = np.array([total_interictal, total_ictal])
+        
         # Get dimensions from first file
-        with h5py.File(self.patient_files[0], 'r') as f:
-            self.n_channels = f['signals'].shape[1]
-            self.n_timesteps = f['signals'].shape[2]
+        data = np.load(self.patient_files[0], mmap_mode='r')
+        self.n_channels = data['signals'].shape[1]
+        self.n_timesteps = data['signals'].shape[2]
         
         print(f"  Total windows: {self.length}")
         print(f"  Window shape: ({self.n_channels}, {self.n_timesteps})")
         print(f"  Interictal (0): {total_interictal} ({100*total_interictal/self.length:.1f}%)")
         print(f"  Ictal (1): {total_ictal} ({100*total_ictal/self.length:.1f}%)")
         
-        # Cache for file handles (one per worker)
-        self._file_handles = {}
+        # Load data based on mode
+        if self.use_mmap:
+            print(f"  Mode: Memory-mapped (lazy loading)")
+            # Cache for memory-mapped file handles (one per worker)
+            self._file_handles = {}
+            self._data_cache = None
+        else:
+            print(f"  Mode: Loading all data into RAM...")
+            self._file_handles = None
+            self._data_cache = self._load_all_data()
+            print(f"  ✓ All data loaded into RAM")
     
-    def _get_h5_file(self, file_idx):
+    def _load_all_data(self):
         """
-        Get or create HDF5 file handle for a specific patient file.
+        Load all data into RAM (non-memory-mapped mode).
+        
+        Returns:
+            List of dicts, one per patient file, containing all data arrays
+        """
+        data_cache = []
+        for file_idx, patient_file in enumerate(self.patient_files):
+            # Load entire file into memory
+            data = np.load(patient_file, allow_pickle=True)
+            
+            # Store as dict of arrays (convert to actual arrays, not memmap)
+            patient_data = {
+                'signals': np.array(data['signals']),
+                'coords': np.array(data['coords']),
+                'regs': np.array(data['regs']),
+                'labels': np.array(data['labels']),
+                'patient_id': data['patient_id'],
+            }
+            
+            # Optional fields
+            if 'n_channels' in data:
+                patient_data['n_channels'] = np.array(data['n_channels'])
+            if 'ch_names' in data:
+                patient_data['ch_names'] = data['ch_names']
+            if 'window_info' in data:
+                patient_data['window_info'] = data['window_info']
+            
+            data_cache.append(patient_data)
+            
+        return data_cache
+    
+    def _get_npz_file(self, file_idx):
+        """
+        Get or create memory-mapped NPZ file handle for a specific patient file.
         Each worker needs its own file handles for thread safety.
         
         Args:
             file_idx: Index of patient file in self.patient_files
         
         Returns:
-            h5py.File handle
+            numpy NpzFile handle with memory mapping
         """
+        if not self.use_mmap:
+            # Return the in-memory cache
+            return self._data_cache[file_idx]
+        
         if file_idx not in self._file_handles:
-            self._file_handles[file_idx] = h5py.File(self.patient_files[file_idx], 'r')
+            self._file_handles[file_idx] = np.load(
+                self.patient_files[file_idx], 
+                mmap_mode='r',
+                allow_pickle=True
+            )
         return self._file_handles[file_idx]
     
     def __len__(self):
@@ -130,10 +198,10 @@ class HDF5WindowDataset(Dataset):
         # Get patient file and window index within that file
         file_idx, window_idx = self.index_map[idx]
         
-        # Get file handle for this patient
-        f = self._get_h5_file(file_idx)
+        # Get memory-mapped file handle for this patient
+        f = self._get_npz_file(file_idx)
         
-        # Load data for this index (only loads this one window)
+        # Load data for this index (memory-mapped, only reads this window from disk)
         # Data is stored as float16 to save space, convert to float32 for PyTorch
         signals = torch.from_numpy(f['signals'][window_idx].astype(np.float32))
         coords = torch.from_numpy(f['coords'][window_idx]).float()
@@ -155,8 +223,8 @@ class HDF5WindowDataset(Dataset):
         if self.return_metadata:
             # Load metadata
             patient_id = self.patient_ids[idx]
-            ch_names = json.loads(f['ch_names'][window_idx].decode('utf-8'))
-            window_info = json.loads(f['window_info'][window_idx].decode('utf-8'))
+            ch_names = json.loads(str(f['ch_names'][window_idx]))
+            window_info = json.loads(str(f['window_info'][window_idx]))
             
             metadata = {
                 'patient_id': patient_id,
@@ -172,7 +240,7 @@ class HDF5WindowDataset(Dataset):
     def get_label(self, idx):
         """Get just the label for a given index (fast)."""
         file_idx, window_idx = self.index_map[idx]
-        f = self._get_h5_file(file_idx)
+        f = self._get_npz_file(file_idx)
         return int(f['labels'][window_idx])
     
     def get_patient_id(self, idx):
@@ -183,39 +251,57 @@ class HDF5WindowDataset(Dataset):
         """Get all labels (loads from all patient files)."""
         labels = []
         for file_idx, patient_file in enumerate(self.patient_files):
-            with h5py.File(patient_file, 'r') as f:
-                labels.extend(f['labels'][:].tolist())
+            data = np.load(patient_file, mmap_mode='r')
+            labels.extend(data['labels'][:].tolist())
         return np.array(labels)
     
     def get_patient_ids(self):
         """Get all patient IDs (already loaded in __init__)."""
         return self.patient_ids
     
+    def get_class_weights(self):
+        """
+        Calculate class weights for handling imbalanced datasets.
+        Uses pre-computed label counts from initialization.
+        
+        Returns:
+            torch.FloatTensor: Class weights for each class
+        """
+        total_samples = self.length
+        num_classes = len(self.label_counts)
+        class_weights = torch.FloatTensor([
+            total_samples / (num_classes * count) 
+            for count in self.label_counts
+        ])
+        return class_weights
+    
     def __del__(self):
-        """Close all HDF5 file handles when dataset is destroyed."""
-        for f in self._file_handles.values():
-            if f is not None:
-                f.close()
+        """Close all NPZ file handles when dataset is destroyed."""
+        if self.use_mmap and self._file_handles is not None:
+            for f in self._file_handles.values():
+                if f is not None:
+                    f.close()
 
 
-def create_dataloader(h5_dir_path, batch_size=32, shuffle=True, num_workers=4, 
-                      return_metadata=False, pin_memory=True, collate_fn=None):
+def create_dataloader(npz_dir_path, batch_size=32, shuffle=True, num_workers=4, 
+                      return_metadata=False, pin_memory=True, collate_fn=None, use_mmap=True):
     """
-    Create a PyTorch DataLoader for the HDF5 dataset.
+    Create a PyTorch DataLoader for the NPZ dataset.
     
     Args:
-        h5_dir_path: Path to directory containing per-patient HDF5 files
+        npz_dir_path: Path to directory containing per-patient NPZ files
         batch_size: Batch size
         shuffle: Whether to shuffle data
         num_workers: Number of worker processes for data loading
         return_metadata: Whether to return metadata with each sample
         pin_memory: Pin memory for faster GPU transfer
         collate_fn: Custom collate function (default handles variable channels with padding)
+        use_mmap: If True, use memory mapping. If False, load all data into RAM.
     
     Returns:
         DataLoader instance
     """
-    dataset = HDF5WindowDataset(h5_dir_path, return_metadata=return_metadata)
+    dataset = NPZWindowDataset(npz_dir_path, return_metadata=return_metadata, use_mmap=use_mmap)
     
     # Default collate function that handles variable channel counts
     if collate_fn is None:
@@ -270,21 +356,22 @@ if __name__ == "__main__":
     from config_benchmark import BenchmarkConfig
     
     print("="*60)
-    print("Testing HDF5 Dataset (Per-Patient Files)")
+    print("Testing NPZ Dataset (Per-Patient Files)")
     print("Data preprocessed following make_dataset.py pipeline")
+    print("Using memory-mapped loading for efficiency")
     print("="*60)
     
     config = BenchmarkConfig()
-    h5_dir = os.path.join(config.OUTPUT_DATA_DIR, "all_windows_per_patient")
+    npz_dir = os.path.join(config.OUTPUT_DATA_DIR, "all_windows_per_patient")
     
-    if not os.path.exists(h5_dir):
-        print(f"\nError: HDF5 directory not found: {h5_dir}")
+    if not os.path.exists(npz_dir):
+        print(f"\nError: NPZ directory not found: {npz_dir}")
         print("Please run extract_all_windows.py first to generate the data.")
         sys.exit(1)
     
     # Test dataset
     print("\n1. Creating dataset...")
-    dataset = HDF5WindowDataset(h5_dir, return_metadata=True)
+    dataset = NPZWindowDataset(npz_dir, return_metadata=True)
     
     print(f"\n2. Dataset length: {len(dataset)}")
     
@@ -299,12 +386,12 @@ if __name__ == "__main__":
     print(f"   Patient ID: {metadata['patient_id']}")
     print(f"   Window info: {metadata['window_info']}")
     
-    print("\n4. Creating DataLoader (batch_size=8, num_workers=2)...")
+    print("\n4. Creating DataLoader (batch_size=8, num_workers=0)...")
     dataloader = create_dataloader(
-        h5_dir, 
+        npz_dir, 
         batch_size=8, 
         shuffle=True, 
-        num_workers=2,
+        num_workers=0,  # Use 0 for testing to avoid Windows multiprocessing issues
         return_metadata=False
     )
     

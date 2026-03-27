@@ -8,12 +8,129 @@ Wraps the MultivarWav2Vec2 encoder with a classification head for:
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'code'))
+
+# Add code directory to path for model imports  
+code_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'code')
+if os.path.exists(code_dir):
+    sys.path.insert(0, code_dir)
 
 import torch
 import torch.nn as nn
-from model_v5 import MultivarWav2Vec2
-from model_config import MODEL_CONFIG
+
+# Import model_config (safe - no file I/O)
+try:
+    from model_config import MODEL_CONFIG
+except ImportError:
+    # Fallback config based on model_config.py
+    # Note: hidden dims must be divisible by num_heads
+    class MODEL_CONFIG:
+        frames = 20
+        channel_buffer_size = 150
+        max_regs = 41
+        ft_enc_dims = (64, 128, 64, 32)
+        ft_enc_strides = (5, 2, 2, 2)
+        ft_enc_kernel_widths = (10, 3, 3, 2)
+        spatial_transformer_blocks = 2
+        spatial_transformer_hidden = 640  # frames * ft_enc_dims[-1] = 20 * 32, adjusted to 640 (divisible by 8)
+        spatial_transformer_heads = 8  # Changed from 7 to 8 (640 / 8 = 80)
+        spatial_transformer_inner_heads = 64
+        spatial_transformer_mlp_dim = 2048
+        temporal_transformer_blocks = 4
+        temporal_transformer_hidden = 4800  # channel_buffer_size * ft_enc_dims[-1] = 150 * 32 (divisible by 8)
+        temporal_transformer_heads = 8
+        temporal_transformer_inner_heads = 64
+        temporal_transformer_mlp_dim = 2048
+        dropout = 0.1
+        activation = "gelu"
+
+# Note: We don't import model_v5.MultivarWav2Vec2 because it triggers config.py
+# which has hardcoded paths. Instead, we reimplement the encoder below.
+
+
+# Helper classes from model_v5.py
+class Transpose(nn.Module):
+    """Transpose tensor dimensions."""
+    def __init__(self, dim0, dim1):
+        super().__init__()
+        self.dim0 = dim0
+        self.dim1 = dim1
+    
+    def forward(self, x):
+        return x.transpose(self.dim0, self.dim1)
+
+
+class PositionalEncoding(nn.Module):
+    """
+    Positional encoding for spatial (region) and temporal (frame) positions.
+    """
+    def __init__(self, d_model, max_regions, max_frames):
+        super().__init__()
+        self.d_model = d_model
+        self.max_regions = max_regions
+        self.max_frames = max_frames
+        
+        # Learnable region embeddings
+        self.region_embedding = nn.Embedding(max_regions + 1, d_model, padding_idx=0)
+        
+        # Learnable frame embeddings
+        self.frame_embedding = nn.Embedding(max_frames, d_model)
+    
+    def forward(self, x, regions):
+        """
+        Args:
+            x: (batch, channels, frames, d_model)
+            regions: (batch, channels) - region indices
+        """
+        batch_size, n_channels, n_frames, d_model = x.shape
+        
+        # Add region embeddings
+        region_emb = self.region_embedding(regions)  # (batch, channels, d_model)
+        region_emb = region_emb.unsqueeze(2).expand(-1, -1, n_frames, -1)
+        x = x + region_emb
+        
+        # Add frame embeddings
+        frame_indices = torch.arange(n_frames, device=x.device)
+        frame_emb = self.frame_embedding(frame_indices)  # (frames, d_model)
+        frame_emb = frame_emb.unsqueeze(0).unsqueeze(0).expand(batch_size, n_channels, -1, -1)
+        x = x + frame_emb
+        
+        return x
+
+
+class Transformer(nn.Module):
+    """
+    Transformer encoder block.
+    """
+    def __init__(self, hidden_dim, num_blocks, num_heads, inner_heads, mlp_dim):
+        super().__init__()
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=mlp_dim,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True
+        )
+        
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_blocks)
+        self.hidden_dim = hidden_dim
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (batch, seq_len, hidden_dim)
+            mask: (batch, seq_len) - boolean mask (True for valid positions)
+        """
+        # Convert mask to attention mask format (additive mask)
+        if mask is not None:
+            # PyTorch expects: False for valid positions, True for positions to ignore
+            attn_mask = ~mask
+        else:
+            attn_mask = None
+        
+        x = self.transformer(x, src_key_padding_mask=attn_mask)
+        return x
 
 
 class MultivarWav2Vec2Classifier(nn.Module):
@@ -72,10 +189,29 @@ class MultivarWav2Vec2Classifier(nn.Module):
             def __init__(self, config, subsample):
                 super().__init__()
                 
+                # Make a copy of config to avoid modifying the original
+                config = type('obj', (object,), {k: v for k, v in vars(config).items() if not k.startswith('__')})()
+                
                 if subsample != 1:
-                    config = type('obj', (object,), vars(config))()  # Make a copy
                     config.channel_buffer_size = int(config.channel_buffer_size * subsample)
                     config.temporal_transformer_hidden = int(config.temporal_transformer_hidden * subsample)
+                
+                # Ensure hidden dimensions are divisible by num_heads
+                # Adjust num_heads if needed (easier than changing model architecture)
+                if config.spatial_transformer_hidden % config.spatial_transformer_heads != 0:
+                    # Find a suitable number of heads that divides the hidden dim
+                    for heads in [8, 10, 16, 5, 4, 2, 1]:
+                        if config.spatial_transformer_hidden % heads == 0:
+                            print(f"  Note: Adjusted spatial_transformer_heads from {config.spatial_transformer_heads} to {heads}")
+                            config.spatial_transformer_heads = heads
+                            break
+                
+                if config.temporal_transformer_hidden % config.temporal_transformer_heads != 0:
+                    for heads in [10, 12, 16, 8, 6, 5, 4, 2, 1]:
+                        if config.temporal_transformer_hidden % heads == 0:
+                            print(f"  Note: Adjusted temporal_transformer_heads from {config.temporal_transformer_heads} to {heads}")
+                            config.temporal_transformer_heads = heads
+                            break
                 
                 # Feature encoder (1D convolutions)
                 self.ft_enc = nn.ModuleList()
@@ -103,7 +239,6 @@ class MultivarWav2Vec2Classifier(nn.Module):
                             )
                         )
                     # Transpose
-                    from model_v5 import Transpose
                     self.ft_enc.append(Transpose(1, 2))
                     # LayerNorm
                     self.ft_enc.append(nn.LayerNorm(config.ft_enc_dims[i]))
@@ -117,13 +252,11 @@ class MultivarWav2Vec2Classifier(nn.Module):
                 self.ft_enc = nn.Sequential(*self.ft_enc)
                 
                 # Positional encoding
-                from model_v5 import PositionalEncoding
                 self.spatiotemporal_pos_encoder = PositionalEncoding(
                     config.ft_enc_dims[-1], config.max_regs, config.frames
                 )
                 
                 # Transformers
-                from model_v5 import Transformer
                 self.spatial_transformer = Transformer(
                     config.spatial_transformer_hidden,
                     config.spatial_transformer_blocks,
@@ -232,7 +365,8 @@ class MultivarWav2Vec2Classifier(nn.Module):
         print(f"Loading pretrained weights from: {checkpoint_path}")
         
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # Use weights_only=False for compatibility with older checkpoints containing numpy objects
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Extract state dict
         if 'state_dict' in checkpoint:
